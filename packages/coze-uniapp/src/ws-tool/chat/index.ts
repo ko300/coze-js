@@ -218,6 +218,11 @@ class WsChatClient extends BaseWsChatClient {
   interrupt() {
     this.ws?.send({
       id: Date.now().toString(),
+      event_type: WebsocketsEventType.INPUT_AUDIO_BUFFER_CLEAR,
+    });
+
+    this.ws?.send({
+      id: Date.now().toString(),
       event_type: WebsocketsEventType.CONVERSATION_CHAT_CANCEL,
     });
 
