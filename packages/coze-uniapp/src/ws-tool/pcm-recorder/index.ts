@@ -45,6 +45,13 @@ export class PcmRecorder {
    */
   private pcmAudioCallback: ((data: { raw: ArrayBuffer }) => void) | undefined;
   /**
+   * Callback function for stop event
+   */
+  public onStop: ((res: any) => void) | undefined;
+
+  public onFrameRecord: ((raw: any) => void) | undefined;
+
+  /**
    * Configuration for the recorder
    */
   private config: PcmRecorderConfig;
@@ -82,6 +89,7 @@ export class PcmRecorder {
       if (this.status === RecordingStatus.RECORDING) {
         // Pass the PCM data to callback
         this.pcmAudioCallback?.({ raw: frameBuffer });
+        this.onFrameRecord?.({ raw: frameBuffer });
       }
 
       if (isLastFrame) {
@@ -96,9 +104,10 @@ export class PcmRecorder {
     });
 
     // Handle recording stop
-    this.recorderManager.onStop(() => {
+    this.recorderManager.onStop(res => {
       this.log('Recording stopped');
       this.status = RecordingStatus.IDLE;
+      this.onStop?.(res);
     });
 
     // Handle recording pause
