@@ -29,7 +29,8 @@ export class PcmStreamPlayer {
   private bufferSize = 1024;
   private base64Queue: Array<{ base64String: string; trackId: string }> = [];
   private isProcessingQueue = false;
-  private lastAudioProcessTime = Infinity;
+  private base64ProcessScheduled = false;
+  private lastAudioProcessTime = 0;
   private processingTimeThreshold = 0; // 1ms threshold
   private isPaused = false; // Track pause state
 
@@ -195,8 +196,8 @@ export class PcmStreamPlayer {
         // Record the last audio process time
         this.lastAudioProcessTime = Date.now();
 
-        // Check if we have base64 data to process and not currently processing
-        this.processBase64Queue();
+        // Avoid heavy decode work in audio callback; schedule it off the callback path
+        this.scheduleBase64QueueProcess();
       };
 
       // Connect to destination (speakers)
@@ -381,12 +382,30 @@ export class PcmStreamPlayer {
     // Add to processing queue
     this.base64Queue.push({ base64String, trackId });
 
-    // If we're outside the processing window, try to process the queue
-    if (this.isProcessingIdle()) {
-      this.processBase64Queue();
-    }
+    // Schedule queue processing outside audio callback
+    this.scheduleBase64QueueProcess();
 
     return true;
+  }
+
+  /**
+   * Schedule base64 queue processing to avoid repeated sync work in audio callbacks
+   * @private
+   */
+  private scheduleBase64QueueProcess() {
+    if (this.base64ProcessScheduled || this.base64Queue.length === 0) {
+      return;
+    }
+
+    this.base64ProcessScheduled = true;
+
+    // Put decoding work into macrotask to reduce chance of blocking audio callback
+    setTimeout(() => {
+      this.base64ProcessScheduled = false;
+      if (this.isProcessingIdle()) {
+        this.processBase64Queue();
+      }
+    }, 0);
   }
 
   /**
@@ -417,12 +436,9 @@ export class PcmStreamPlayer {
     } finally {
       this.isProcessingQueue = false;
 
-      // If there are more items and we're still outside the processing window, process the next item
+      // If there are more items, continue scheduling processing in small chunks
       if (this.base64Queue.length > 0) {
-        if (this.isProcessingIdle()) {
-          // Use setTimeout to give the main thread a chance to breathe
-          setTimeout(() => this.processBase64Queue(), 0);
-        }
+        this.scheduleBase64QueueProcess();
       }
     }
   }
@@ -458,8 +474,14 @@ export class PcmStreamPlayer {
       } else if (audioFormat === 'g711u') {
         buffer = decodeUlaw(arrayBuffer);
       } else {
-        // Treat as PCM data in Uint8Array
-        buffer = new Int16Array(arrayBuffer.buffer);
+        // Treat as PCM data in Uint8Array and respect view offset/length
+        const byteLength =
+          arrayBuffer.byteLength - (arrayBuffer.byteLength % 2);
+        buffer = new Int16Array(
+          arrayBuffer.buffer,
+          arrayBuffer.byteOffset,
+          Math.floor(byteLength / 2),
+        );
       }
     } else if (arrayBuffer instanceof ArrayBuffer) {
       // Handle different formats based on the specified format
@@ -527,8 +549,11 @@ export class PcmStreamPlayer {
     if (interrupt && trackId) {
       this.interruptedTrackIds[trackId] = true;
 
-      // Clear the audio queue for interrupted track
+      // Clear queued audio (decoded + undecoded) for interrupted track
       this.audioQueue = [];
+      this.base64Queue = [];
+      this.isProcessingQueue = false;
+      this.base64ProcessScheduled = false;
 
       // Disconnect the current scriptNode if exists
       if (this.scriptNode) {
