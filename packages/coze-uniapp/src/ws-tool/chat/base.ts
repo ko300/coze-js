@@ -68,8 +68,8 @@ export class BaseWsChatClient {
     this.config = config;
 
     this.wavStreamPlayer = new PcmStreamPlayer({
-      sampleRate: 8000,
-      defaultFormat: 'g711a',
+      sampleRate: 24000,
+      defaultFormat: 'pcm',
       volume: this.config.playbackVolumeDefault ?? 1.0,
     });
   }
