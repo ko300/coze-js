@@ -1,6 +1,6 @@
 {
   "name": "@ko300/coze-uniapp-api",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Custom Coze UniApp SDK with voice saving support",
   "keywords": [
     "coze",

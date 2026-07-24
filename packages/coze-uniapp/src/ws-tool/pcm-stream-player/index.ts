@@ -2,6 +2,13 @@
 import { StreamResampler } from './resampler';
 import { decodeAlaw, decodeUlaw } from './codecs/g711';
 
+// 缓冲水位（毫秒）：初始启动与断流恢复都要积攒到该水位才开始/恢复输出
+const JITTER_BUFFER_MS = 200;
+// 尾包排空超时（毫秒）：处于积攒状态但超过该时长没有新包到达，视为流已结束，直接排空剩余数据
+const DRAIN_TIMEOUT_MS = 250;
+// 恢复输出时的淡入步长（每样本增量，48kHz 下约 5ms 完成淡入，防爆音）
+const FADE_IN_STEP = 1 / 256;
+
 /**
  * PcmStreamPlayer 支持的音频格式
  */
@@ -45,6 +52,13 @@ export class PcmStreamPlayer {
   // 当前正在播放的 PCM buffer 及其读取位置
   private currentBuffer: Int16Array | null = null;
   private playbackPosition = 0;
+
+  // 缓冲状态机：初始/断流后为 true，此时只输出静音，水位达标或尾包超时才恢复输出
+  private isBuffering = true;
+  // 恢复输出时的淡入增益（0~1）
+  private resumeGain = 1.0;
+  // 最后一个数据包到达时间，用于尾包排空判断
+  private lastChunkTime = 0;
 
   /** 默认音频格式 */
   private defaultFormat: AudioFormat = 'pcm';
@@ -166,14 +180,9 @@ export class PcmStreamPlayer {
         return false;
       }
 
-      // 断开旧节点，防止重复播放（音频重叠）
+      // scriptNode 常驻复用：已存在时不再拆建，拆建节点会在播放中产生爆音
       if (this.scriptNode) {
-        try {
-          this.scriptNode.disconnect();
-          this.scriptNode = null;
-        } catch (error) {
-          console.warn('断开旧 scriptNode 出错:', error);
-        }
+        return true;
       }
 
       const scriptNode = this.audioContext?.createScriptProcessor
@@ -210,19 +219,52 @@ export class PcmStreamPlayer {
   }
 
   /**
+   * 计算当前已缓冲的音频时长（毫秒），含正在播放的 buffer 剩余部分
+   * @private
+   */
+  private getBufferedMs(): number {
+    let samples = this.audioQueue.reduce((sum, chunk) => sum + chunk.length, 0);
+    if (this.currentBuffer) {
+      samples += Math.max(0, this.currentBuffer.length - this.playbackPosition);
+    }
+    return (samples / this.outputSampleRate) * 1000;
+  }
+
+  /**
    * 将 audioQueue 中的数据填充到输出帧
    *
-   * 【修复】原代码在循环中途队列耗尽时执行 `this.isProcessing = i !== outputBuffer.length - 1`，
-   * 这是一个依赖循环中间状态的赋值，逻辑不清晰，且可能导致 isProcessing 提前变为 false，
-   * 触发 add16BitPCM 再次调用 startPlayback，创建第二个 scriptNode，造成音频重叠。
-   *
-   * 修复方案：统一在整帧填充结束后才修改 isProcessing，中途队列耗尽时仅填充静音并立即 return。
+   * 缓冲状态机（是否出声的唯一控制点）：
+   * - isBuffering=true：只输出淡出尾音/静音，不消费队列；
+   *   攒够 JITTER_BUFFER_MS 恢复输出；或队列有数据但超过 DRAIN_TIMEOUT_MS
+   *   没有新包（流已结束），直接排空剩余数据
+   * - 播放中队列耗尽：本帧余下淡出，重新进入 isBuffering
+   * 恢复输出时用 resumeGain 做短淡入，防止波形突跳爆音
    * @private
    */
   private fillOutputBuffer(outputBuffer: Float32Array): void {
     const vol = this.volume <= 0 ? 0 : this.volume;
-    let hasData = true;
 
+    if (this.isBuffering) {
+      const bufferedMs = this.getBufferedMs();
+      const streamEnded =
+        bufferedMs > 0 &&
+        this.lastChunkTime > 0 &&
+        Date.now() - this.lastChunkTime > DRAIN_TIMEOUT_MS;
+      if (bufferedMs >= JITTER_BUFFER_MS || streamEnded) {
+        this.isBuffering = false;
+        this.resumeGain = 0.0;
+      } else {
+        // 水位不足：输出淡出尾音/静音等待积攒
+        for (let j = 0; j < outputBuffer.length; j++) {
+          this.fadeLastSample *= 0.98;
+          outputBuffer[j] = this.fadeLastSample;
+        }
+        this.isProcessing = false;
+        return;
+      }
+    }
+
+    let hasData = true;
     for (let i = 0; i < outputBuffer.length; i++) {
       // 当前 buffer 耗尽时，尝试从队列获取下一个
       while (
@@ -234,7 +276,13 @@ export class PcmStreamPlayer {
       }
 
       if (hasData && this.currentBuffer) {
-        let sample = (this.currentBuffer[this.playbackPosition] / 0x8000) * vol;
+        if (this.resumeGain < 1.0) {
+          this.resumeGain = Math.min(1.0, this.resumeGain + FADE_IN_STEP);
+        }
+        let sample =
+          (this.currentBuffer[this.playbackPosition] / 0x8000) *
+          vol *
+          this.resumeGain;
         // 硬限幅，防止数值溢出导致爆音
         if (sample > 1.0) {
           sample = 1.0;
@@ -242,23 +290,29 @@ export class PcmStreamPlayer {
           sample = -1.0;
         }
         outputBuffer[i] = sample;
-        this.fadeLastSample = sample; // 记录最后一个有效样本，用于断流淡出
+        this.fadeLastSample = sample; // 记录最后一个有效样本，供断流淡出衔接
         this.playbackPosition++;
       } else {
-        // 队列已空，使用指数淡出平滑过渡到静音，防止断流 Click 声
+        // 队列耗尽：本帧余下淡出，进入重新积攒状态
         for (let j = i; j < outputBuffer.length; j++) {
-          this.fadeLastSample *= 0.8;
+          this.fadeLastSample *= 0.98;
           outputBuffer[j] = this.fadeLastSample;
         }
-        // 整帧结束后才将 isProcessing 置为 false，
-        // 避免在帧中途被 add16BitPCM 误判并重复调用 startPlayback
+        // 仅在"包还在到达却断流"时告警（真饿死）；正常回复播完的收尾静默进入积攒
+        if (
+          this.lastChunkTime > 0 &&
+          Date.now() - this.lastChunkTime <= DRAIN_TIMEOUT_MS
+        ) {
+          console.log('[PcmStreamPlayer] 缓冲耗尽，进入重新积攒');
+        }
+        this.isBuffering = true;
         this.isProcessing = false;
         return;
       }
     }
 
-    this.fadeLastSample = 0.0;
-    // 整帧数据填充完毕，保持 isProcessing = true
+    // 注意：整帧填满后不再把 fadeLastSample 清零，
+    // 下一帧若一开始就断流，要从真实的最后样本淡出，否则帧边界断流会爆音
     this.isProcessing = true;
   }
 
@@ -513,20 +567,12 @@ export class PcmStreamPlayer {
     }
 
     this.audioQueue.push(buffer);
+    this.lastChunkTime = Date.now();
 
-    // isProcessing 只有在 fillOutputBuffer 整帧处理完毕后才会被设为 false，
-    // 这里检查确保不会重复创建 scriptNode 导致音频重叠
-    if (!this.isProcessing && !this.isPaused) {
-      // Jitter Buffer：积攒足够数据再启动，避免频繁"启动->饿死->再启动"产生杂音
-      // 计算 audioQueue 中的总样本数并换算为毫秒（使用 outputSampleRate）
-      const totalSamples = this.audioQueue.reduce(
-        (sum, chunk) => sum + chunk.length,
-        0,
-      );
-      const bufferedMs = (totalSamples / this.outputSampleRate) * 1000;
-      if (bufferedMs >= 150 || this.audioQueue.length >= 3) {
-        this.startPlayback();
-      }
+    // scriptNode 首包即创建并常驻；是否出声统一由 fillOutputBuffer 的
+    // 缓冲状态机（水位 + 尾包超时）控制，此处不再做启动判断，消除双路竞态
+    if (!this.scriptNode && !this.isPaused) {
+      this.startPlayback();
     }
 
     return buffer;
@@ -586,6 +632,11 @@ export class PcmStreamPlayer {
       }
       // 重置淡出状态
       this.fadeLastSample = 0.0;
+
+      // 重置缓冲状态机，下一段音频重新积攒后再出声
+      this.isBuffering = true;
+      this.resumeGain = 1.0;
+      this.lastChunkTime = 0;
 
       this.isProcessing = false;
     }

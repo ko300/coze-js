@@ -1,11 +1,14 @@
 /**
  * 流式音频重采样器
- * 支持跨分片状态保持，彻底消除分片拼接处的波形断层
+ * 跨分片保持两项状态：小数位偏移 + 上一包末尾样本，
+ * 保证分片边界区间也有正常插值，消除拼接处的波形断层
  */
 export class StreamResampler {
   private inputSampleRate: number;
   private outputSampleRate: number;
-  private lastFraction = 0.0; // 记录上一包末尾遗留的小数位偏移
+  private lastFraction = 0.0; // 下一个输出点相对"虚拟缓冲"起点的位置
+  private hasLastSample = false; // 是否持有上一包末尾样本
+  private lastSample = 0; // 上一包最后一个输入样本，用于跨包插值
 
   constructor(inputSampleRate: number, outputSampleRate: number) {
     this.inputSampleRate = inputSampleRate;
@@ -13,67 +16,65 @@ export class StreamResampler {
   }
 
   /**
-   * 对一段 PCM 分片进行重采样，自动补偿上一包的小数位偏移
+   * 对一段 PCM 分片进行重采样
+   * 虚拟缓冲 = [上一包末尾样本] + 本包，使跨包区间 [prev末样本, next首样本] 也被插值覆盖
    * @param {Int16Array} inputBuffer - 输入 PCM 分片
    * @returns {Int16Array} - 重采样后的 PCM 分片
    */
   resample(inputBuffer: Int16Array): Int16Array {
-    if (this.inputSampleRate === this.outputSampleRate) {
+    if (
+      this.inputSampleRate === this.outputSampleRate ||
+      inputBuffer.length === 0
+    ) {
       return inputBuffer;
     }
 
-    const ratio = this.outputSampleRate / this.inputSampleRate;
-    // 补偿上一包末尾遗留的小数偏移，精确计算本包最大可能输出长度
-    const maxOutputLength = Math.ceil(
-      (inputBuffer.length - this.lastFraction) * ratio,
+    const step = this.inputSampleRate / this.outputSampleRate;
+    const prependCount = this.hasLastSample ? 1 : 0;
+    const virtualLength = inputBuffer.length + prependCount;
+    // 读取虚拟缓冲第 i 个样本（0 号位可能是上一包末尾样本）
+    const readVirtual = (i: number): number =>
+      i < prependCount ? this.lastSample : inputBuffer[i - prependCount];
+
+    const maxOutputLength = Math.max(
+      Math.ceil((virtualLength - 1 - this.lastFraction) / step) + 1,
+      0,
     );
     const outputBuffer = new Int16Array(maxOutputLength);
 
-    let actualOutputLength = 0;
-
-    for (let i = 0; i < maxOutputLength; i++) {
-      // 从上一包遗留的小数偏移处开始计算当前输出点对应的输入位置
-      const inputPos = this.lastFraction + i / ratio;
-      const inputIndex = Math.floor(inputPos);
-
-      // 越界：当前包数据不足以完成下一次双点插值
-      // 正确做法是截断，并将此刻的 inputPos 小数部分保存为下一包的起始偏移
-      // 不能强行填充，否则会造成指针超额消费，引发累积漂移
-      if (inputIndex >= inputBuffer.length - 1) {
-        // 精确计算跨包起始小数位：inputPos 相对于本包末尾的超出量
-        // 即下一包从 inputPos - (inputBuffer.length - 1) 处开始读取
-        this.lastFraction = inputPos - (inputBuffer.length - 1);
-        break;
-      }
-
-      const fraction = inputPos - inputIndex;
-      const sample1 = inputBuffer[inputIndex];
-      const sample2 = inputBuffer[inputIndex + 1];
-      const interpolatedValue = sample1 + fraction * (sample2 - sample1);
-      outputBuffer[actualOutputLength] = Math.max(
-        Math.min(Math.round(interpolatedValue), 32767),
+    let outputCount = 0;
+    let pos = this.lastFraction;
+    while (Math.floor(pos) < virtualLength - 1) {
+      const index = Math.floor(pos);
+      const fraction = pos - index;
+      const sample1 = readVirtual(index);
+      const sample2 = readVirtual(index + 1);
+      const value = sample1 + fraction * (sample2 - sample1);
+      outputBuffer[outputCount] = Math.max(
+        Math.min(Math.round(value), 32767),
         -32768,
       );
-      actualOutputLength++;
+      outputCount++;
+      pos += step;
     }
 
-    // 若循环正常跑完（未因越界 break），按实际消费量更新 lastFraction
-    if (actualOutputLength === maxOutputLength) {
-      const totalInputConsumed = this.lastFraction + maxOutputLength / ratio;
-      this.lastFraction = totalInputConsumed - Math.floor(totalInputConsumed);
-    }
+    // 保存本包末尾样本供下一包插值；pos 已越过虚拟缓冲最后一个可插值区间
+    this.lastSample = readVirtual(virtualLength - 1);
+    this.hasLastSample = true;
+    this.lastFraction = pos - (virtualLength - 1);
 
-    // 裁剪掉因越界提前截断而未填充的尾部空槽
-    return actualOutputLength === maxOutputLength
+    return outputCount === outputBuffer.length
       ? outputBuffer
-      : outputBuffer.slice(0, actualOutputLength);
+      : outputBuffer.slice(0, outputCount);
   }
 
   /**
-   * 重置小数位偏移（切换音轨/中断时调用，防止残留状态污染下一段音频）
+   * 重置跨包状态（切换音轨/中断时调用，防止残留状态污染下一段音频）
    */
   reset(): void {
     this.lastFraction = 0.0;
+    this.hasLastSample = false;
+    this.lastSample = 0;
   }
 }
 
