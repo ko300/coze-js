@@ -227,6 +227,7 @@ class WsChatClient extends BaseWsChatClient {
     });
 
     this.emit(WsChatEventNames.INTERRUPTED, undefined);
+    this.recorder.destroy();
   }
 }
 
